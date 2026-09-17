@@ -1,9 +1,15 @@
-"""
+    """
 ASTRUM Discord Monitor — browser-based scraper
 Logs in as the user, reads watched channels, sends daily summary + real-time alerts.
 """
 
-import os, asyncio, smtplib, json, re
+import os, asyncio, smtplib, json, re, subprocess, sys
+
+# Install Chromium browser at startup (Railway doesn't persist build artifacts)
+print("Installing Chromium...")
+subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+subprocess.run([sys.executable, "-m", "playwright", "install-deps", "chromium"], check=False)
+print("Chromium ready.")
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -320,3 +326,5 @@ async def run():
             await asyncio.sleep(300)
 
 asyncio.run(run())
+
+    
