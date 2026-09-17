@@ -1,366 +1,322 @@
-import discord
-import smtplib
-import asyncio
-import os
-import json
-from datetime import datetime, time
+"""
+ASTRUM Discord Monitor — browser-based scraper
+Logs in as the user, reads watched channels, sends daily summary + real-time alerts.
+"""
+
+import os, asyncio, smtplib, json, re
+from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from zoneinfo import ZoneInfo
+from playwright.async_api import async_playwright
 
-# ── Configuration ────────────────────────────────────────────────────────────
-DISCORD_TOKEN   = os.environ["DISCORD_TOKEN"]
-EMAIL_ADDRESS   = os.environ["EMAIL_ADDRESS"]    # klcaprio@hotmail.com
-EMAIL_PASSWORD  = os.environ["EMAIL_PASSWORD"]   # app password
-ALERT_EMAIL     = os.environ["ALERT_EMAIL"]      # klcaprio@hotmail.com
+# ── Config ────────────────────────────────────────────────────────────────────
+DISCORD_EMAIL    = os.environ["DISCORD_EMAIL"]
+DISCORD_PASSWORD = os.environ["DISCORD_PASSWORD"]
+EMAIL_ADDRESS    = os.environ["EMAIL_ADDRESS"]      # klcaprio@hotmail.com
+EMAIL_PASSWORD   = os.environ["EMAIL_PASSWORD"]      # outlook app password
+ALERT_EMAIL      = os.environ["ALERT_EMAIL"]         # klcaprio@hotmail.com
 
-EASTERN = ZoneInfo("America/New_York")
-DAILY_SUMMARY_HOUR = 18   # 6 PM EST
+EASTERN = timezone(timedelta(hours=-4))  # ET (adjust to -5 in Nov for EST)
+DAILY_SUMMARY_HOUR = 18  # 6 PM ET
 
-# ── Channels to monitor (exact Discord channel names) ────────────────────────
-WATCHED_CHANNELS = {
-    # OA Challenge+
-    "2026-q3-leads", "2026-q4-leads",
-    "flip-alert-leads", "deals-feed",
-    "ai-chat", "announcements",
-    "amazon-ecommerce-news", "source-lens-support",
-    "asin-so-support", "discontinued-bolos",
-    "wins", "guides-and-sops",
-    # The Amazon Launchpad
-    "ungating", "auto-ungate-asins",
-    "sourcing-questions", "keepa-analysis",
-    "software-questions",
-    "success",
-    "retailers-that-cancel", "lessons-learned",
-}
-
-# ── Alert keywords (triggers real-time email) ─────────────────────────────────
-ALERT_KEYWORDS = [
-    # Flips / leads
-    "flip", "amazon to amazon", "a to a", "a2a", "flip alert",
-    "bolo", "buy box", "arbitrage",
-    # Ungating
-    "ungat", "ungate", "approved", "invoice approved",
-    "brand approved", "category approved", "gated", "get approved",
-    # AI tools
-    "chatgpt", "claude", "ai tool", "gpt", "copilot", "gemini",
-    "ai sourcing", "ai leads", "automation", "ai finds",
-    # Software
-    "source lens", "sourcelens", "keepa", "asin.so", "scanpower",
-    "seller amp", "selleramp", "tactical arbitrage", "oaxray",
-    "storefront stalker", "flip alert", "update", "new feature",
-    # OA retailers
-    "walmart", "target", "home depot", "lowes", "costco", "staples",
-    "office depot", "best buy", "kohls", "macys", "nordstrom",
-    "dick's sporting", "academy", "crocs", "adidas", "new balance",
-]
-
-# ── Skip keywords (never alert on these) ─────────────────────────────────────
-SKIP_KEYWORDS = [
-    "canada", "canadian", "uk ", "united kingdom", "ebay uk",
-    "amazon.ca", "amazon.co.uk", "introduce yourself", "hello everyone",
-    "just joined", "new member", "hi i'm", "hi i am",
-]
-
-# ── ROI / profit filter ───────────────────────────────────────────────────────
-MIN_PROFIT = 7.0
-MIN_ROI    = 50.0
+MIN_PROFIT = 7
+MIN_ROI    = 50
 MAX_BSR    = 150_000
 
-# ── Storage for daily summary ─────────────────────────────────────────────────
-daily_log: list[dict] = []
-last_summary_date: str = ""
+# ── Channels to monitor: {server_id: [channel_ids or names]} ─────────────────
+# We identify channels by name since IDs can change
+WATCHED = {
+    "OA Challenge+": [
+        "2026-q3-leads", "2026-q4-leads", "flip-alert-leads", "deals-feed",
+        "ai-chat", "announcements", "amazon-ecommerce-news",
+        "source-lens-support", "asin-so-support", "discontinued-bolos",
+        "wins", "guides-and-sops",
+    ],
+    "The Amazon Launchpad": [
+        "ungating", "auto-ungate-asins", "sourcing-questions",
+        "keepa-analysis", "software-questions", "announcements",
+        "success", "retailers-that-cancel", "lessons-learned",
+    ],
+}
 
-# ─────────────────────────────────────────────────────────────────────────────
+SKIP_KEYWORDS = [
+    "canada", "canadian", "uk ", "united kingdom", "british", "£",
+    "introduce yourself", "intro post", "just joined", "new member",
+]
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
+ALERT_KEYWORDS = [
+    "flip", "ungate", "ungated", "ungating", "lead", "deal", "roi",
+    "profit", "bsr", "keepa", "ai tool", "sourcelen", "asin.so",
+    "software update", "retailer", "bolos", "restricted", "approve",
+]
 
-client = discord.Client(intents=intents)
-
-
-# ── Email helper ──────────────────────────────────────────────────────────────
-def send_email(subject: str, body_html: str) -> None:
+# ── Email helpers ─────────────────────────────────────────────────────────────
+def send_email(subject: str, html: str):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = EMAIL_ADDRESS
     msg["To"]      = ALERT_EMAIL
-    msg.attach(MIMEText(body_html, "html"))
+    msg.attach(MIMEText(html, "html"))
+    with smtplib.SMTP("smtp-mail.outlook.com", 587) as s:
+        s.starttls()
+        s.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        s.sendmail(EMAIL_ADDRESS, ALERT_EMAIL, msg.as_string())
 
-    with smtplib.SMTP("smtp-mail.outlook.com", 587) as server:
-        server.starttls()
-        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_ADDRESS, ALERT_EMAIL, msg.as_string())
-
-
-# ── Message scoring / filtering ───────────────────────────────────────────────
-def should_skip(text: str) -> bool:
-    tl = text.lower()
-    return any(kw in tl for kw in SKIP_KEYWORDS)
-
-
-def get_alert_reason(text: str) -> str | None:
-    tl = text.lower()
-    for kw in ALERT_KEYWORDS:
-        if kw in tl:
-            return kw
-    return None
-
-
-def extract_numbers(text: str) -> dict:
-    """Best-effort extraction of profit / ROI / BSR from message text."""
-    import re
-    numbers = {}
-
-    profit_match = re.search(r"\$\s*([\d,]+\.?\d*)\s*profit", text, re.I)
-    if profit_match:
-        numbers["profit"] = float(profit_match.group(1).replace(",", ""))
-
-    roi_match = re.search(r"([\d,]+\.?\d*)\s*%\s*roi", text, re.I)
-    if roi_match:
-        numbers["roi"] = float(roi_match.group(1).replace(",", ""))
-
-    bsr_match = re.search(r"bsr[:\s#]*([0-9,]+)", text, re.I)
-    if bsr_match:
-        numbers["bsr"] = int(bsr_match.group(1).replace(",", ""))
-
-    return numbers
-
-
-def passes_profit_filter(text: str) -> tuple[bool, dict]:
-    """Returns (passes, numbers_found). If no numbers found, passes by default."""
-    nums = extract_numbers(text)
-    if not nums:
-        return True, nums   # no numbers → don't filter out
-
-    profit_ok = nums.get("profit", MIN_PROFIT) >= MIN_PROFIT
-    roi_ok    = nums.get("roi",    MIN_ROI)    >= MIN_ROI
-    bsr_ok    = nums.get("bsr",    1)          <= MAX_BSR
-
-    return profit_ok and roi_ok and bsr_ok, nums
-
-
-# ── Alert email HTML ──────────────────────────────────────────────────────────
-def build_alert_html(msg: discord.Message, reason: str, nums: dict) -> str:
-    now    = datetime.now(EASTERN).strftime("%b %d %Y %I:%M %p ET")
-    server = msg.guild.name if msg.guild else "Unknown Server"
-    chan   = f"#{msg.channel.name}" if hasattr(msg.channel, "name") else ""
-    author = str(msg.author.display_name)
-    url    = msg.jump_url
-
-    numbers_html = ""
-    if nums:
-        rows = "".join(
-            f"<tr><td style='padding:4px 12px 4px 0;color:#888'>{k.upper()}</td>"
-            f"<td style='padding:4px 0;font-weight:bold'>{v}</td></tr>"
-            for k, v in nums.items()
-        )
-        numbers_html = f"<table style='margin:8px 0'>{rows}</table>"
-
-    content = msg.content.replace("<", "&lt;").replace(">", "&gt;")
-    # Highlight the triggering keyword
-    import re
-    content = re.sub(
-        f"({re.escape(reason)})",
-        r"<mark style='background:#fff3cd'>\1</mark>",
-        content, flags=re.I
-    )
-
+def build_alert_html(server, channel, author, content, reason):
     return f"""
-<html><body style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto;padding:20px">
-<div style="background:#1a1a2e;color:white;padding:16px 20px;border-radius:8px 8px 0 0">
-  <h2 style="margin:0;font-size:18px">🚨 ASTRUM Discord Alert</h2>
-  <p style="margin:4px 0 0;opacity:.7;font-size:13px">{now}</p>
+<html><body style="font-family:Arial,sans-serif;max-width:600px;margin:auto">
+<div style="background:#5865F2;padding:16px;border-radius:8px 8px 0 0">
+  <h2 style="color:white;margin:0">🚨 ASTRUM Discord Alert</h2>
+  <p style="color:#ddd;margin:4px 0 0">{reason}</p>
 </div>
-<div style="background:#f8f9fa;padding:16px 20px;border-left:4px solid #e63946">
-  <p style="margin:0"><strong>Server:</strong> {server} &nbsp;|&nbsp; <strong>Channel:</strong> {chan}</p>
-  <p style="margin:4px 0 0"><strong>Posted by:</strong> {author}</p>
-  <p style="margin:4px 0 0"><strong>Triggered by:</strong> <code style="background:#e9ecef;padding:2px 6px;border-radius:4px">{reason}</code></p>
-  {numbers_html}
+<div style="border:1px solid #ddd;border-top:none;padding:16px;border-radius:0 0 8px 8px">
+  <p><strong>Server:</strong> {server}<br>
+     <strong>Channel:</strong> #{channel}<br>
+     <strong>Posted by:</strong> {author}<br>
+     <strong>Time:</strong> {datetime.now(EASTERN).strftime('%I:%M %p ET')}</p>
+  <div style="background:#f5f5f5;padding:12px;border-left:4px solid #5865F2;border-radius:4px">
+    {content}
+  </div>
 </div>
-<div style="background:white;padding:20px;border:1px solid #dee2e6;border-top:none;white-space:pre-wrap;font-size:14px;line-height:1.6">
-{content}
-</div>
-<div style="padding:12px 20px;background:#f1f3f5;border-radius:0 0 8px 8px;font-size:13px">
-  <a href="{url}" style="color:#1971c2;text-decoration:none">→ Jump to message in Discord</a>
-</div>
-</body></html>
-"""
+</body></html>"""
 
-
-# ── Daily summary HTML ────────────────────────────────────────────────────────
-def build_summary_html(entries: list[dict]) -> str:
-    now = datetime.now(EASTERN).strftime("%B %d, %Y")
-
-    if not entries:
-        return f"""
-<html><body style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto;padding:20px">
-<h2>📋 ASTRUM Daily Discord Summary — {now}</h2>
-<p>No flagged activity today across monitored channels.</p>
-</body></html>
-"""
-
-    # Group by category
-    cats = {
-        "🔄 Flips & Leads":       [],
-        "🔓 Ungating":            [],
-        "🤖 AI Tools":            [],
-        "🛍️ OA Retailers":        [],
-        "💻 Software Updates":    [],
-        "🏆 Wins & Tips":         [],
-        "📣 Other":               [],
-    }
-
-    def categorize(reason: str, text: str) -> str:
-        r = reason.lower()
-        t = text.lower()
-        if any(k in r for k in ["flip","bolo","arbitrage","a2a","a to a","buy box","lead"]):
-            return "🔄 Flips & Leads"
-        if any(k in r for k in ["ungat","approved","gated","invoice"]):
-            return "🔓 Ungating"
-        if any(k in r for k in ["chatgpt","claude","gpt","gemini","copilot","ai tool","ai sourcing","ai leads","automation","ai finds"]):
-            return "🤖 AI Tools"
-        if any(k in r for k in ["walmart","target","home depot","lowes","costco","staples",
-                                  "office depot","best buy","kohls","macys","nordstrom",
-                                  "dick","academy","crocs","adidas","new balance"]):
-            return "🛍️ OA Retailers"
-        if any(k in r for k in ["source lens","sourcelens","keepa","asin.so","scanpower",
-                                  "selleramp","tactical","oaxray","storefront","update","feature"]):
-            return "💻 Software Updates"
-        if any(k in t for k in ["win","success","approved","profit"]):
-            return "🏆 Wins & Tips"
-        return "📣 Other"
-
-    for e in entries:
-        cat = categorize(e["reason"], e["content"])
-        cats[cat].append(e)
-
-    sections = ""
-    for cat, items in cats.items():
-        if not items:
-            continue
+def build_summary_html(daily_log):
+    if not daily_log:
+        body = "<p>No qualifying posts captured today.</p>"
+    else:
         rows = ""
-        for e in items:
-            snippet = e["content"][:200].replace("<","&lt;").replace(">","&gt;")
-            if len(e["content"]) > 200:
-                snippet += "…"
+        for item in daily_log:
             rows += f"""
-<tr>
-  <td style="padding:10px;border-bottom:1px solid #f1f3f5;vertical-align:top;width:130px;color:#555;font-size:12px">
-    {e['time']}<br><strong>{e['channel']}</strong><br><em>{e['author']}</em>
-  </td>
-  <td style="padding:10px;border-bottom:1px solid #f1f3f5;font-size:14px;line-height:1.5">
-    {snippet}<br>
-    <a href="{e['url']}" style="font-size:12px;color:#1971c2">→ View in Discord</a>
-  </td>
-</tr>"""
+            <tr>
+              <td style="padding:8px;border-bottom:1px solid #eee">{item['time']}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee">{item['server']}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee">#{item['channel']}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee">{item['author']}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee">{item['reason']}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;max-width:300px">{item['content'][:200]}{'...' if len(item['content'])>200 else ''}</td>
+            </tr>"""
+        body = f"""
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+          <thead>
+            <tr style="background:#5865F2;color:white">
+              <th style="padding:8px;text-align:left">Time</th>
+              <th style="padding:8px;text-align:left">Server</th>
+              <th style="padding:8px;text-align:left">Channel</th>
+              <th style="padding:8px;text-align:left">Author</th>
+              <th style="padding:8px;text-align:left">Category</th>
+              <th style="padding:8px;text-align:left">Post</th>
+            </tr>
+          </thead>
+          <tbody>{rows}</tbody>
+        </table>"""
 
-        sections += f"""
-<h3 style="margin:24px 0 8px;color:#1a1a2e">{cat} <span style="font-weight:normal;font-size:14px;color:#888">({len(items)} item{'s' if len(items)!=1 else ''})</span></h3>
-<table style="width:100%;border-collapse:collapse;background:white;border:1px solid #dee2e6;border-radius:8px">
-{rows}
-</table>"""
-
+    date_str = datetime.now(EASTERN).strftime("%B %d, %Y")
     return f"""
-<html><body style="font-family:Arial,sans-serif;max-width:720px;margin:0 auto;padding:20px;color:#212529">
-<div style="background:#1a1a2e;color:white;padding:20px;border-radius:8px 8px 0 0">
-  <h1 style="margin:0;font-size:22px">📋 ASTRUM Daily Discord Summary</h1>
-  <p style="margin:6px 0 0;opacity:.7">{now} &nbsp;·&nbsp; {len(entries)} flagged items across monitored channels</p>
+<html><body style="font-family:Arial,sans-serif;max-width:900px;margin:auto">
+<div style="background:#5865F2;padding:16px;border-radius:8px 8px 0 0">
+  <h2 style="color:white;margin:0">📋 ASTRUM Daily Discord Summary</h2>
+  <p style="color:#ddd;margin:4px 0 0">{date_str} · {len(daily_log)} items captured</p>
 </div>
-<div style="padding:20px 0">
-{sections}
+<div style="border:1px solid #ddd;border-top:none;padding:16px;border-radius:0 0 8px 8px">
+  {body}
+  <p style="color:#999;font-size:11px;margin-top:16px">
+    Monitoring: OA Challenge+ &amp; The Amazon Launchpad ·
+    Filters: profit ≥$7 · ROI ≥50% · BSR ≤150,000 · US only
+  </p>
 </div>
-<div style="background:#f8f9fa;padding:16px;border-radius:8px;font-size:13px;color:#666;margin-top:16px">
-  Monitoring: OA Challenge+ &amp; The Amazon Launchpad &nbsp;·&nbsp;
-  Filters: profit ≥$7 · ROI ≥50% · BSR ≤150,000 · US only
-</div>
-</body></html>
-"""
+</body></html>"""
 
+# ── Filtering ─────────────────────────────────────────────────────────────────
+def should_skip(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in SKIP_KEYWORDS)
 
-# ── Discord events ────────────────────────────────────────────────────────────
-@client.event
-async def on_ready():
-    print(f"✅ ASTRUM Monitor online as {client.user}")
-    client.loop.create_task(daily_summary_scheduler())
+def get_alert_reason(text: str) -> str:
+    t = text.lower()
+    if any(k in t for k in ["flip", "amazon to amazon", "a2a"]):
+        return "Amazon Flip"
+    if any(k in t for k in ["ungate", "ungated", "ungating", "restricted", "approve"]):
+        return "Ungating"
+    if any(k in t for k in ["lead", "deal", "bolo", "profit", "roi", "bsr"]):
+        return "OA Lead"
+    if any(k in t for k in ["ai tool", "sourcelen", "asin.so", "software", "keepa"]):
+        return "Tool/AI Update"
+    if any(k in t for k in ["retailer", "source", "cancel"]):
+        return "Retailer Intel"
+    return ""
 
+def passes_profit_filter(text: str) -> bool:
+    """Return True if post passes profit/ROI/BSR filters OR has no numbers (cast wide net)."""
+    t = text.lower()
+    profits = [float(x) for x in re.findall(r'\$(\d+(?:\.\d+)?)', t)]
+    rois    = [float(x) for x in re.findall(r'(\d+(?:\.\d+)?)\s*%', t)]
+    bsrs    = [float(x.replace(',','')) for x in re.findall(r'bsr[:\s#]*([0-9,]+)', t)]
 
-@client.event
-async def on_message(message: discord.Message):
-    # Ignore bot's own messages
-    if message.author.bot:
-        return
+    if profits and max(profits) < MIN_PROFIT:
+        return False
+    if rois and max(rois) < MIN_ROI:
+        return False
+    if bsrs and min(bsrs) > MAX_BSR:
+        return False
+    return True
 
-    # Only watch specific channels
-    channel_name = getattr(message.channel, "name", "")
-    if channel_name not in WATCHED_CHANNELS:
-        return
+# ── Main scraper loop ─────────────────────────────────────────────────────────
+async def run():
+    daily_log       = []
+    last_summary_date = ""
+    seen_messages   = set()  # track message IDs to avoid duplicates
 
-    text = message.content
-    if not text.strip():
-        return
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
 
-    # Skip filtered content
-    if should_skip(text):
-        return
+        # ── Log in ────────────────────────────────────────────────────────────
+        page = await context.new_page()
+        print("🔐 Logging into Discord...")
+        await page.goto("https://discord.com/login", wait_until="networkidle")
+        await page.fill('input[name="email"]', DISCORD_EMAIL)
+        await page.fill('input[name="password"]', DISCORD_PASSWORD)
+        await page.click('button[type="submit"]')
+        await page.wait_for_timeout(5000)
 
-    # Check for alert keywords
-    reason = get_alert_reason(text)
-    if not reason:
-        return
+        # Handle any 2FA / captcha by waiting up to 30s for the app to load
+        try:
+            await page.wait_for_selector('[class*="guilds"]', timeout=30000)
+            print("✅ Logged in successfully")
+        except:
+            print("⚠️  Login may need manual action — check for captcha")
 
-    # Check profit filter
-    passes, nums = passes_profit_filter(text)
-    if not passes:
-        return
+        # Save session cookies so we can restore if needed
+        cookies = await context.cookies()
+        with open("/tmp/discord_cookies.json", "w") as f:
+            json.dump(cookies, f)
 
-    now_et = datetime.now(EASTERN)
+        # ── Build channel URL map ─────────────────────────────────────────────
+        # Navigate to each server and collect channel URLs
+        print("🗺️  Building channel map...")
+        channel_urls = {}  # channel_name -> full discord URL
 
-    # Log for daily summary
-    daily_log.append({
-        "time":    now_et.strftime("%I:%M %p"),
-        "channel": f"#{channel_name}",
-        "server":  message.guild.name if message.guild else "",
-        "author":  message.author.display_name,
-        "content": text,
-        "reason":  reason,
-        "url":     message.jump_url,
-        "nums":    nums,
-    })
+        for guild_name, channels in WATCHED.items():
+            # Find the guild in the sidebar
+            guild_el = await page.query_selector(f'[aria-label="{guild_name}"]')
+            if not guild_el:
+                # Try partial match
+                all_guilds = await page.query_selector_all('[class*="listItem"] [class*="wrapper"]')
+                for g in all_guilds:
+                    label = await g.get_attribute("aria-label") or ""
+                    if guild_name.lower() in label.lower():
+                        guild_el = g
+                        break
 
-    # Send real-time alert email
-    try:
-        subject = f"🚨 Discord Alert: {reason.title()} in #{channel_name}"
-        html    = build_alert_html(message, reason, nums)
-        send_email(subject, html)
-        print(f"📧 Alert sent: {reason} in #{channel_name}")
-    except Exception as e:
-        print(f"❌ Email error: {e}")
+            if guild_el:
+                await guild_el.click()
+                await page.wait_for_timeout(2000)
 
+                for ch_name in channels:
+                    # Find channel link
+                    ch_links = await page.query_selector_all('[class*="channel"] a[href*="/channels/"]')
+                    for link in ch_links:
+                        text = (await link.inner_text()).strip().lower()
+                        if ch_name.lower().replace("-", " ") in text or ch_name.lower() in text:
+                            href = await link.get_attribute("href")
+                            if href:
+                                channel_urls[f"{guild_name}::{ch_name}"] = f"https://discord.com{href}"
+                                print(f"  ✅ Mapped {guild_name} :: #{ch_name}")
+                            break
+            else:
+                print(f"  ⚠️  Could not find server: {guild_name}")
 
-# ── Daily summary scheduler ───────────────────────────────────────────────────
-async def daily_summary_scheduler():
-    global daily_log, last_summary_date
+        print(f"📡 Monitoring {len(channel_urls)} channels")
 
-    await client.wait_until_ready()
-    while not client.is_closed():
-        now = datetime.now(EASTERN)
-        today = now.strftime("%Y-%m-%d")
+        # ── Poll loop ─────────────────────────────────────────────────────────
+        while True:
+            now = datetime.now(EASTERN)
 
-        if now.hour == DAILY_SUMMARY_HOUR and now.minute == 0 and today != last_summary_date:
-            last_summary_date = today
-            try:
-                subject = f"📋 ASTRUM Daily Discord Summary — {now.strftime('%B %d, %Y')}"
-                html    = build_summary_html(daily_log)
-                send_email(subject, html)
-                print(f"📧 Daily summary sent: {len(daily_log)} items")
-                daily_log = []   # reset for next day
-            except Exception as e:
-                print(f"❌ Summary email error: {e}")
+            # Check each channel
+            for key, url in channel_urls.items():
+                guild_name, ch_name = key.split("::")
+                try:
+                    await page.goto(url, wait_until="networkidle", timeout=15000)
+                    await page.wait_for_timeout(2000)
 
-        await asyncio.sleep(60)   # check every minute
+                    # Get recent messages
+                    messages = await page.query_selector_all('[class*="messageListItem"]')
 
+                    for msg in messages[-20:]:  # last 20 messages
+                        try:
+                            msg_id = await msg.get_attribute("id") or ""
+                            if msg_id in seen_messages:
+                                continue
+                            seen_messages.add(msg_id)
 
-# ── Run ───────────────────────────────────────────────────────────────────────
-client.run(DISCORD_TOKEN)
+                            content_el = await msg.query_selector('[class*="messageContent"]')
+                            author_el  = await msg.query_selector('[class*="username"]')
+
+                            if not content_el:
+                                continue
+
+                            content = (await content_el.inner_text()).strip()
+                            author  = (await author_el.inner_text()).strip() if author_el else "Unknown"
+
+                            if not content or should_skip(content):
+                                continue
+
+                            reason = get_alert_reason(content)
+                            if not reason:
+                                continue
+
+                            if not passes_profit_filter(content):
+                                continue
+
+                            # New qualifying message!
+                            item = {
+                                "time":    now.strftime("%I:%M %p"),
+                                "server":  guild_name,
+                                "channel": ch_name,
+                                "author":  author,
+                                "content": content,
+                                "reason":  reason,
+                            }
+                            daily_log.append(item)
+                            print(f"📌 [{reason}] {guild_name} #{ch_name}: {content[:60]}")
+
+                            # Real-time alert
+                            try:
+                                subject = f"🚨 Discord Alert: {reason} in #{ch_name}"
+                                html    = build_alert_html(guild_name, ch_name, author, content, reason)
+                                send_email(subject, html)
+                                print(f"📧 Alert sent")
+                            except Exception as e:
+                                print(f"❌ Alert email error: {e}")
+
+                        except Exception as e:
+                            print(f"  ⚠️  Message parse error: {e}")
+
+                except Exception as e:
+                    print(f"⚠️  Error reading {guild_name} #{ch_name}: {e}")
+
+            # Keep seen_messages from growing forever
+            if len(seen_messages) > 10000:
+                seen_messages = set(list(seen_messages)[-5000:])
+
+            # Daily summary at 6 PM ET
+            today = now.strftime("%Y-%m-%d")
+            if now.hour == DAILY_SUMMARY_HOUR and now.minute < 5 and today != last_summary_date:
+                last_summary_date = today
+                try:
+                    subject = f"📋 ASTRUM Daily Discord Summary — {now.strftime('%B %d, %Y')}"
+                    html    = build_summary_html(daily_log)
+                    send_email(subject, html)
+                    print(f"📧 Daily summary sent: {len(daily_log)} items")
+                    daily_log = []
+                except Exception as e:
+                    print(f"❌ Summary email error: {e}")
+
+            # Poll every 5 minutes
+            print(f"💤 Sleeping 5 min... ({now.strftime('%I:%M %p ET')})")
+            await asyncio.sleep(300)
+
+asyncio.run(run())
