@@ -2,5 +2,5 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python bot.py"
+startCommand = "playwright install chromium --with-deps && python bot.py"
 restartPolicyType = "always"
